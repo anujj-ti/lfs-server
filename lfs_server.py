@@ -3,25 +3,76 @@
 import os
 import json
 import hashlib
-from flask import Flask, request, jsonify, send_file
-from werkzeug.exceptions import NotFound
+import boto3
+from botocore.exceptions import ClientError
+from flask import Flask, request, jsonify, Response
+import config
 
 app = Flask(__name__)
 
-# Directory to store LFS objects
-STORAGE_DIR = "lfs_storage"
-os.makedirs(STORAGE_DIR, exist_ok=True)
+# S3 Configuration
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+    region_name=config.AWS_DEFAULT_REGION
+)
 
-def get_object_path(oid):
-    """Get the file path for an object ID"""
+BUCKET_NAME = config.S3_BUCKET
+
+def get_s3_key(oid):
+    """Get the S3 key for an object ID"""
     # Store in subdirectories like Git does: first 2 chars / rest
-    return os.path.join(STORAGE_DIR, oid[:2], oid[2:])
+    return f"lfs-objects/{oid[:2]}/{oid[2:]}"
 
-def ensure_object_dir(oid):
-    """Ensure the directory exists for an object"""
-    obj_path = get_object_path(oid)
-    os.makedirs(os.path.dirname(obj_path), exist_ok=True)
-    return obj_path
+def object_exists_in_s3(oid):
+    """Check if object exists in S3"""
+    s3_key = get_s3_key(oid)
+    print(f"🔍 Checking if object exists in S3: {s3_key}")
+    try:
+        s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+        print(f"✅ Object exists in S3: {s3_key}")
+        return True
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        if error_code == '404':
+            print(f"📭 Object not found in S3: {s3_key}")
+        else:
+            print(f"❌ Error checking S3 object: {e}")
+        return False
+
+def upload_to_s3(oid, data):
+    """Upload object to S3"""
+    s3_key = get_s3_key(oid)
+    print(f"🔄 Uploading to S3: {s3_key} ({len(data)} bytes)")
+    try:
+        response = s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=s3_key,
+            Body=data,
+            ContentType='application/octet-stream'
+        )
+        print(f"✅ S3 upload successful: {response.get('ETag', 'No ETag')}")
+        return True
+    except ClientError as e:
+        print(f"❌ Error uploading to S3: {e}")
+        print(f"Error code: {e.response.get('Error', {}).get('Code', 'Unknown')}")
+        print(f"Error message: {e.response.get('Error', {}).get('Message', 'Unknown')}")
+        return False
+
+def download_from_s3(oid):
+    """Download object from S3"""
+    s3_key = get_s3_key(oid)
+    print(f"🔄 Downloading from S3: {s3_key}")
+    try:
+        response = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+        data = response['Body'].read()
+        print(f"✅ S3 download successful: {len(data)} bytes")
+        return data
+    except ClientError as e:
+        print(f"❌ Error downloading from S3: {e}")
+        print(f"Error code: {e.response.get('Error', {}).get('Code', 'Unknown')}")
+        return None
 
 @app.route('/<path:repo_path>/objects/batch', methods=['POST'])
 def batch_objects(repo_path):
@@ -39,14 +90,13 @@ def batch_objects(repo_path):
     for obj in objects:
         oid = obj['oid']
         size = obj['size']
-        obj_path = get_object_path(oid)
         
         print(f"Processing object: {oid}, size: {size}")
         
         if operation == 'download':
-            # Check if object exists
-            if os.path.exists(obj_path):
-                # Return download URL
+            # Check if object exists in S3
+            if object_exists_in_s3(oid):
+                # Return download URL (using our server endpoint)
                 response_objects.append({
                     'oid': oid,
                     'size': size,
@@ -92,39 +142,45 @@ def batch_objects(repo_path):
 
 @app.route('/<path:repo_path>/objects/<oid>', methods=['PUT'])
 def upload_object(repo_path, oid):
-    """Handle object upload"""
+    """Handle object upload to S3"""
     print(f"Upload object: {oid} for repo: {repo_path}")
     
-    obj_path = ensure_object_dir(oid)
+    # Get the uploaded data
+    uploaded_data = request.data
     
-    # Write the uploaded data
-    with open(obj_path, 'wb') as f:
-        f.write(request.data)
-    
-    # Verify the uploaded file
-    with open(obj_path, 'rb') as f:
-        actual_hash = hashlib.sha256(f.read()).hexdigest()
+    # Verify the hash
+    actual_hash = hashlib.sha256(uploaded_data).hexdigest()
     
     if actual_hash != oid:
         print(f"Hash mismatch! Expected: {oid}, Got: {actual_hash}")
-        os.remove(obj_path)
         return jsonify({'error': 'Hash mismatch'}), 400
     
-    print(f"Successfully uploaded object: {oid}")
-    return '', 200
+    # Upload to S3
+    if upload_to_s3(oid, uploaded_data):
+        print(f"Successfully uploaded object: {oid} to S3")
+        return '', 200
+    else:
+        print(f"Failed to upload object: {oid} to S3")
+        return jsonify({'error': 'Upload failed'}), 500
 
 @app.route('/<path:repo_path>/objects/<oid>', methods=['GET'])
 def download_object(repo_path, oid):
-    """Handle object download"""
+    """Handle object download from S3"""
     print(f"Download object: {oid} for repo: {repo_path}")
     
-    obj_path = get_object_path(oid)
+    # Download from S3
+    data = download_from_s3(oid)
     
-    if not os.path.exists(obj_path):
+    if data is None:
         print(f"Object not found: {oid}")
         return jsonify({'error': 'Object not found'}), 404
     
-    return send_file(obj_path, as_attachment=True, download_name=oid)
+    # Return the data as a response
+    return Response(
+        data,
+        mimetype='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename={oid}'}
+    )
 
 @app.route('/<path:repo_path>/objects', methods=['POST'])  
 def legacy_objects(repo_path):
@@ -145,19 +201,31 @@ def legacy_objects(repo_path):
 def info():
     """Basic info endpoint"""
     return jsonify({
-        'message': 'Simple Git LFS Server',
-        'version': '1.0',
-        'storage_dir': STORAGE_DIR
+        'message': 'S3-backed Git LFS Server',
+        'version': '2.0',
+        'storage_backend': 's3',
+        'bucket': BUCKET_NAME,
+        'region': config.AWS_DEFAULT_REGION
     })
 
 if __name__ == '__main__':
-    print("Starting simple Git LFS server...")
-    print(f"Storage directory: {os.path.abspath(STORAGE_DIR)}")
+    print("Starting S3-backed Git LFS server...")
+    print(f"S3 Bucket: {BUCKET_NAME}")
+    print(f"AWS Region: {config.AWS_DEFAULT_REGION}")
     print("Server will run at: http://localhost:8123")
     print()
     print("To use with git:")
     print("git config lfs.url http://localhost:8123/myrepo")
-    print("git lfs track '*.bin'")
+    print("git lfs track '*.large'")
     print()
     
+    # Test S3 connectivity
+    try:
+        s3_client.head_bucket(Bucket=BUCKET_NAME)
+        print("✅ S3 bucket accessible")
+    except ClientError as e:
+        print(f"❌ S3 bucket not accessible: {e}")
+        print("Please check your AWS credentials and bucket permissions")
+    
+    print()
     app.run(host='0.0.0.0', port=8123, debug=True)

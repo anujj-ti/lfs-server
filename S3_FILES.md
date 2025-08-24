@@ -36,3 +36,10 @@ aws s3 cp s3://alpha-learn-content-dev/lfs-objects/{path} filename
 - **Bucket**: alpha-learn-content-dev
 - **Region**: us-east-1
 - **Prefix**: lfs-objects/
+
+## workflow_test.large (NEW!)
+- **Direct URL**: https://alpha-learn-content-dev.s3.us-east-1.amazonaws.com/lfs-objects/95/67dffb62c0736f47d699567057de851bd8a4fe9b552b8ad321ba04a03497fe
+- **Size**: 73 bytes
+- **Hash**: 9567dffb62c0736f47d699567057de851bd8a4fe9b552b8ad321ba04a03497fe
+- **Download**: `curl "https://alpha-learn-content-dev.s3.us-east-1.amazonaws.com/lfs-objects/95/67dffb62c0736f47d699567057de851bd8a4fe9b552b8ad321ba04a03497fe" -o workflow_test.large`
+- **Content**: Full S3-GitHub workflow test file
