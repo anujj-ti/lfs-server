@@ -1,1 +1,8 @@
+# Sensitive files
 config.py
+*.pyc
+__pycache__/
+.env
+
+# LFS storage
+lfs_storage/
