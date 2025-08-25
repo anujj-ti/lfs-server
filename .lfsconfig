@@ -1,3 +1,0 @@
-# LFS configuration moved to git config for security
-# Custom transfer agent settings are configured via:
-# git config lfs.customtransfer.lfs-s3.*
