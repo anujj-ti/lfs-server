@@ -10,9 +10,9 @@ import config
 
 app = Flask(__name__)
 
-# Path mapping: OID -> relative file path from lfs_storage/
-# This gets populated when files are scanned
-path_mapping = {}
+# S3 versioning mapping: OID -> {path, version_id}
+# Stores version information for proper LFS versioning
+version_mapping = {}
 
 # S3 Configuration
 s3_client = boto3.client(
@@ -24,28 +24,28 @@ s3_client = boto3.client(
 
 BUCKET_NAME = config.S3_BUCKET
 
-def load_path_mapping():
-    """Load path mapping from a JSON file"""
-    mapping_file = "oid_to_path_mapping.json"
-    global path_mapping
+def load_version_mapping():
+    """Load version mapping from a JSON file"""
+    mapping_file = "s3_version_mapping.json"
+    global version_mapping
     try:
         if os.path.exists(mapping_file):
             with open(mapping_file, 'r') as f:
-                path_mapping = json.load(f)
-            print(f"📋 Loaded {len(path_mapping)} path mappings")
+                version_mapping = json.load(f)
+            print(f"📋 Loaded {len(version_mapping)} S3 version mappings")
     except Exception as e:
-        print(f"❌ Error loading path mapping: {e}")
-        path_mapping = {}
+        print(f"❌ Error loading version mapping: {e}")
+        version_mapping = {}
 
-def save_path_mapping():
-    """Save path mapping to a JSON file"""
-    mapping_file = "oid_to_path_mapping.json"
+def save_version_mapping():
+    """Save version mapping to a JSON file"""
+    mapping_file = "s3_version_mapping.json"
     try:
         with open(mapping_file, 'w') as f:
-            json.dump(path_mapping, f, indent=2)
-        print(f"💾 Saved {len(path_mapping)} path mappings")
+            json.dump(version_mapping, f, indent=2)
+        print(f"💾 Saved {len(version_mapping)} S3 version mappings")
     except Exception as e:
-        print(f"❌ Error saving path mapping: {e}")
+        print(f"❌ Error saving version mapping: {e}")
 
 def get_file_path_from_local(oid):
     """Find the file path for an OID by scanning lfs_storage directory"""
@@ -69,30 +69,30 @@ def get_file_path_from_local(oid):
     return None
 
 def get_s3_key(oid):
-    """Get the S3 key for an object ID - uses path mapping for path-based storage"""
-    # First try the mapping
-    if oid in path_mapping:
-        file_path = path_mapping[oid]
-        print(f"📋 Using cached path for {oid[:8]}...: {file_path}")
-        return file_path
+    """Get the S3 key for an object ID - uses only folder structure paths"""
+    # Check if we have version mapping for this OID
+    if oid in version_mapping:
+        s3_path = version_mapping[oid]['path']
+        print(f"📋 Using versioned path for {oid[:8]}...: {s3_path}")
+        return s3_path
     
-    # If not in mapping, scan lfs_storage directory
+    # Try to find the file in lfs_storage directory to determine path
     file_path = get_file_path_from_local(oid)
     if file_path:
-        # Save this mapping for future use
-        path_mapping[oid] = file_path
-        save_path_mapping()
-        print(f"🔍 Found and cached path for {oid[:8]}...: {file_path}")
+        print(f"🔍 Found local file for {oid[:8]}...: {file_path}")
         return file_path
     
-    # Fallback to old hash-based approach if file not found locally
-    fallback_path = f"lfs-objects/{oid[:2]}/{oid[2:]}"
-    print(f"⚠️  Using fallback hash-based path for {oid[:8]}...: {fallback_path}")
-    return fallback_path
+    # No hash-based fallback - file must be in lfs_storage structure
+    print(f"❌ Object {oid[:8]}... not found in lfs_storage/ directory")
+    return None
 
 def object_exists_in_s3(oid):
     """Check if object exists in S3"""
     s3_key = get_s3_key(oid)
+    if s3_key is None:
+        print(f"❌ Cannot check S3 - no valid path for {oid[:8]}...")
+        return False
+        
     print(f"🔍 Checking if object exists in S3: {s3_key}")
     try:
         s3_client.head_object(Bucket=BUCKET_NAME, Key=s3_key)
@@ -107,8 +107,12 @@ def object_exists_in_s3(oid):
         return False
 
 def upload_to_s3(oid, data):
-    """Upload object to S3"""
+    """Upload object to S3 with versioning support"""
     s3_key = get_s3_key(oid)
+    if s3_key is None:
+        print(f"❌ Cannot upload - no valid path for {oid[:8]}...")
+        return False
+        
     print(f"🔄 Uploading to S3: {s3_key} ({len(data)} bytes)")
     try:
         response = s3_client.put_object(
@@ -117,7 +121,20 @@ def upload_to_s3(oid, data):
             Body=data,
             ContentType='application/octet-stream'
         )
-        print(f"✅ S3 upload successful: {response.get('ETag', 'No ETag')}")
+        
+        # Capture S3 version ID for proper versioning
+        version_id = response.get('VersionId')
+        etag = response.get('ETag', 'No ETag')
+        
+        # Store version mapping
+        version_mapping[oid] = {
+            'path': s3_key,
+            'version_id': version_id,
+            'etag': etag
+        }
+        save_version_mapping()
+        
+        print(f"✅ S3 upload successful: {etag} (Version: {version_id})")
         return True
     except ClientError as e:
         print(f"❌ Error uploading to S3: {e}")
@@ -126,11 +143,29 @@ def upload_to_s3(oid, data):
         return False
 
 def download_from_s3(oid):
-    """Download object from S3"""
+    """Download object from S3 with version support"""
     s3_key = get_s3_key(oid)
-    print(f"🔄 Downloading from S3: {s3_key}")
+    if s3_key is None:
+        print(f"❌ Cannot download - no valid path for {oid[:8]}...")
+        return None
+    
+    # Get version info if available
+    version_info = version_mapping.get(oid)
+    version_id = version_info.get('version_id') if version_info else None
+    
+    print(f"🔄 Downloading from S3: {s3_key} (Version: {version_id or 'latest'})")
+    
     try:
-        response = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+        # Download specific version if available
+        if version_id:
+            response = s3_client.get_object(
+                Bucket=BUCKET_NAME, 
+                Key=s3_key, 
+                VersionId=version_id
+            )
+        else:
+            response = s3_client.get_object(Bucket=BUCKET_NAME, Key=s3_key)
+            
         data = response['Body'].read()
         print(f"✅ S3 download successful: {len(data)} bytes")
         return data
@@ -158,7 +193,10 @@ def batch_objects(repo_path):
         
         print(f"Processing object: {oid}, size: {size}")
         s3_key = get_s3_key(oid)
-        print(f"  📁 S3 path will be: {s3_key}")
+        if s3_key:
+            print(f"  📁 S3 path will be: {s3_key}")
+        else:
+            print(f"  ❌ No valid S3 path for {oid[:8]}...")
         
         if operation == 'download':
             # Check if object exists in S3
@@ -268,29 +306,30 @@ def legacy_objects(repo_path):
 def info():
     """Basic info endpoint"""
     return jsonify({
-        'message': 'Path-based S3 Git LFS Server',
-        'version': '3.0',
+        'message': 'S3 Versioned Git LFS Server',
+        'version': '4.0',
         'storage_backend': 's3',
         'bucket': BUCKET_NAME,
         'region': config.AWS_DEFAULT_REGION,
-        'storage_method': 'path-based',
-        'tracked_paths': len(path_mapping)
+        'storage_method': 'folder-based with S3 versioning',
+        'versioned_objects': len(version_mapping)
     })
 
 if __name__ == '__main__':
-    print("Starting Path-based S3 Git LFS server...")
+    print("Starting S3 Versioned Git LFS server...")
     print(f"S3 Bucket: {BUCKET_NAME}")
     print(f"AWS Region: {config.AWS_DEFAULT_REGION}")
-    print("Storage Method: Path-based (lfs_storage/ → S3)")
+    print("Storage Method: Folder-based with S3 versioning")
     print("Server will run at: http://localhost:8123")
+    print("Public URL: https://bf921069a201.ngrok-free.app")
     print()
     print("To use with git:")
-    print("git config lfs.url http://localhost:8123/myrepo")
+    print("git config lfs.url https://bf921069a201.ngrok-free.app/lfs-server")
     print("git lfs track 'lfs_storage/**'")
     print()
     
-    # Load existing path mappings
-    load_path_mapping()
+    # Load existing version mappings
+    load_version_mapping()
     
     # Test S3 connectivity
     try:

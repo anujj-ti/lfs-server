@@ -3,3 +3,4 @@ config.py
 *.pyc
 __pycache__/
 .env
+s3_version_mapping.json
