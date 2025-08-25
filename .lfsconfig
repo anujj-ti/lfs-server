@@ -1,7 +1,3 @@
-[lfs "customtransfer.lfs-s3"]
-    path = lfs-s3
-    args = --bucket alpha-learn-content-dev --region us-east-1
-    direction = both
-
-[lfs]
-    transfer = lfs-s3
+# LFS configuration moved to git config for security
+# Custom transfer agent settings are configured via:
+# git config lfs.customtransfer.lfs-s3.*
