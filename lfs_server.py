@@ -10,6 +10,10 @@ import config
 
 app = Flask(__name__)
 
+# Path mapping: OID -> relative file path from lfs_storage/
+# This gets populated when files are scanned
+path_mapping = {}
+
 # S3 Configuration
 s3_client = boto3.client(
     's3',
@@ -20,10 +24,71 @@ s3_client = boto3.client(
 
 BUCKET_NAME = config.S3_BUCKET
 
+def load_path_mapping():
+    """Load path mapping from a JSON file"""
+    mapping_file = "oid_to_path_mapping.json"
+    global path_mapping
+    try:
+        if os.path.exists(mapping_file):
+            with open(mapping_file, 'r') as f:
+                path_mapping = json.load(f)
+            print(f"📋 Loaded {len(path_mapping)} path mappings")
+    except Exception as e:
+        print(f"❌ Error loading path mapping: {e}")
+        path_mapping = {}
+
+def save_path_mapping():
+    """Save path mapping to a JSON file"""
+    mapping_file = "oid_to_path_mapping.json"
+    try:
+        with open(mapping_file, 'w') as f:
+            json.dump(path_mapping, f, indent=2)
+        print(f"💾 Saved {len(path_mapping)} path mappings")
+    except Exception as e:
+        print(f"❌ Error saving path mapping: {e}")
+
+def get_file_path_from_local(oid):
+    """Find the file path for an OID by scanning lfs_storage directory"""
+    lfs_storage_dir = "lfs_storage"
+    if not os.path.exists(lfs_storage_dir):
+        return None
+    
+    # Scan all files in lfs_storage and calculate their hashes
+    for root, dirs, files in os.walk(lfs_storage_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            try:
+                with open(file_path, 'rb') as f:
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                    if file_hash == oid:
+                        # Return relative path from lfs_storage/
+                        relative_path = os.path.relpath(file_path, lfs_storage_dir)
+                        return relative_path.replace('\\', '/')  # Normalize path separators
+            except Exception as e:
+                continue
+    return None
+
 def get_s3_key(oid):
-    """Get the S3 key for an object ID"""
-    # Store in subdirectories like Git does: first 2 chars / rest
-    return f"lfs-objects/{oid[:2]}/{oid[2:]}"
+    """Get the S3 key for an object ID - uses path mapping for path-based storage"""
+    # First try the mapping
+    if oid in path_mapping:
+        file_path = path_mapping[oid]
+        print(f"📋 Using cached path for {oid[:8]}...: {file_path}")
+        return file_path
+    
+    # If not in mapping, scan lfs_storage directory
+    file_path = get_file_path_from_local(oid)
+    if file_path:
+        # Save this mapping for future use
+        path_mapping[oid] = file_path
+        save_path_mapping()
+        print(f"🔍 Found and cached path for {oid[:8]}...: {file_path}")
+        return file_path
+    
+    # Fallback to old hash-based approach if file not found locally
+    fallback_path = f"lfs-objects/{oid[:2]}/{oid[2:]}"
+    print(f"⚠️  Using fallback hash-based path for {oid[:8]}...: {fallback_path}")
+    return fallback_path
 
 def object_exists_in_s3(oid):
     """Check if object exists in S3"""
@@ -92,6 +157,8 @@ def batch_objects(repo_path):
         size = obj['size']
         
         print(f"Processing object: {oid}, size: {size}")
+        s3_key = get_s3_key(oid)
+        print(f"  📁 S3 path will be: {s3_key}")
         
         if operation == 'download':
             # Check if object exists in S3
@@ -102,7 +169,7 @@ def batch_objects(repo_path):
                     'size': size,
                     'actions': {
                         'download': {
-                            'href': f'http://localhost:8123/{repo_path}/objects/{oid}',
+                            'href': f'https://bf921069a201.ngrok-free.app/{repo_path}/objects/{oid}',
                             'header': {},
                             'expires_in': 3600
                         }
@@ -126,7 +193,7 @@ def batch_objects(repo_path):
                 'size': size,
                 'actions': {
                     'upload': {
-                        'href': f'http://localhost:8123/{repo_path}/objects/{oid}',
+                        'href': f'https://bf921069a201.ngrok-free.app/{repo_path}/objects/{oid}',
                         'header': {},
                         'expires_in': 3600
                     }
@@ -201,23 +268,29 @@ def legacy_objects(repo_path):
 def info():
     """Basic info endpoint"""
     return jsonify({
-        'message': 'S3-backed Git LFS Server',
-        'version': '2.0',
+        'message': 'Path-based S3 Git LFS Server',
+        'version': '3.0',
         'storage_backend': 's3',
         'bucket': BUCKET_NAME,
-        'region': config.AWS_DEFAULT_REGION
+        'region': config.AWS_DEFAULT_REGION,
+        'storage_method': 'path-based',
+        'tracked_paths': len(path_mapping)
     })
 
 if __name__ == '__main__':
-    print("Starting S3-backed Git LFS server...")
+    print("Starting Path-based S3 Git LFS server...")
     print(f"S3 Bucket: {BUCKET_NAME}")
     print(f"AWS Region: {config.AWS_DEFAULT_REGION}")
+    print("Storage Method: Path-based (lfs_storage/ → S3)")
     print("Server will run at: http://localhost:8123")
     print()
     print("To use with git:")
     print("git config lfs.url http://localhost:8123/myrepo")
-    print("git lfs track '*.large'")
+    print("git lfs track 'lfs_storage/**'")
     print()
+    
+    # Load existing path mappings
+    load_path_mapping()
     
     # Test S3 connectivity
     try:
