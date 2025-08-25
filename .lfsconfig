@@ -1,2 +1,7 @@
+[lfs "customtransfer.lfs-s3"]
+    path = lfs-s3
+    args = --bucket alpha-learn-content-dev --region us-east-1
+    direction = both
+
 [lfs]
-	url = https://bf921069a201.ngrok-free.app/lfs-server
+    transfer = lfs-s3
