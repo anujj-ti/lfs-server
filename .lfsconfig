@@ -1,2 +1,2 @@
 [lfs]
-	url = http://localhost:8123/lfs-server
+	url = https://9cc21c05509d.ngrok-free.app/lfs-server
